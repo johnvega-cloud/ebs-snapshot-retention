@@ -1,0 +1,31 @@
+# --- Terraform (e2e harness) ---
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+tfdestroy
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# --- Run output: reports and logs hold account, volume and snapshot IDs ---
+e2e/aws/e2e-out/
+e2e/aws/e2e-out-console.txt
+*.report.json
+report.json
+last-run.json
+
+# --- Tooling ---
+.venv/
+__pycache__/
+
+# --- OS / editors ---
+.DS_Store
+.idea/
+.vscode/
