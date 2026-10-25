@@ -1,0 +1,21 @@
+# Runs on an EC2 admin host with an instance profile that has
+# iam/ebs-snapshot-backup-policy.json attached. Logs go to the journal:
+#   journalctl -u ebs-snapshot-backup.service
+[Unit]
+Description=Snapshot EBS volumes of Backup=true instances and apply retention
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=backup
+Environment=AWS_REGION=us-east-1
+ExecStart=/usr/local/bin/ebs-snapshot-backup --policy daily --retention-days 30 --log-format json --report /var/lib/ebs-snapshot-backup/last-run.json
+StateDirectory=ebs-snapshot-backup
+# Exit 3 = finished with failures: the unit shows as failed and OnFailure= can alert.
+SuccessExitStatus=0
+TimeoutStartSec=2h
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

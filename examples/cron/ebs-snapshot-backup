@@ -1,0 +1,11 @@
+# /etc/cron.d/ebs-snapshot-backup
+# Daily at 02:15 UTC, keep 30 days. Monthly on the 1st, keep 365 days.
+# The two policies have separate locks and never prune each other's snapshots.
+# Exit code 3 (partial failure) makes cron mail the output to MAILTO.
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=ops@example.com
+CRON_TZ=UTC
+
+15 2 * * * backup /usr/local/bin/ebs-snapshot-backup --region us-east-1 --policy daily --retention-days 30 --log-format json >>/var/log/ebs-snapshot-backup.log 2>&1 || echo "ebs-snapshot-backup daily exited $?"
+45 2 1 * * backup /usr/local/bin/ebs-snapshot-backup --region us-east-1 --policy monthly --retention-days 365 --keep-min 3 --log-format json >>/var/log/ebs-snapshot-backup.log 2>&1 || echo "ebs-snapshot-backup monthly exited $?"
