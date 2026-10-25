@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" viewBox="0 0 1400 900" width="1400" height="900" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>ebs-snapshot-retention: snapshot the EBS volumes of running Backup=true instances, then prune this tool's snapshots older than the retention period</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#232F3E"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#D13212"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3F8624"/>
+    </marker>
+    <style>
+      .t  { fill: #232F3E; }
+      .mu { fill: #545B64; }
+      .mono { font-family: 'SFMono-Regular', Menlo, Consolas, monospace; font-size: 13px; fill: #232F3E; }
+      .monos { font-family: 'SFMono-Regular', Menlo, Consolas, monospace; font-size: 12px; fill: #545B64; white-space: pre; }
+      .solid { stroke: #232F3E; stroke-width: 2.2; fill: none; }
+      .dash  { stroke: #232F3E; stroke-width: 2; fill: none; stroke-dasharray: 7 5; }
+      .red   { stroke: #D13212; stroke-width: 2.2; fill: none; }
+      .green { stroke: #3F8624; stroke-width: 2.2; fill: none; }
+      .step { fill: #FFFFFF; font-size: 13px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <!-- White canvas so the diagram stays legible on GitHub dark mode -->
+  <rect width="1400" height="900" fill="#FFFFFF"/>
+
+  <text x="30" y="42" class="t" font-size="26" font-weight="700">ebs-snapshot-backup: daily EBS snapshots with retention</text>
+  <text x="30" y="68" class="mu" font-size="14">Bash + AWS CLI + jq. Snapshots before it prunes, and it only prunes snapshots that carry its own tag and policy name.</text>
+
+  <!-- ===== Runner ===== -->
+  <rect x="30" y="100" width="330" height="430" rx="8" fill="#F2F3F3" stroke="#545B64" stroke-width="2"/>
+  <text x="50" y="130" class="t" font-size="17" font-weight="700">Runner</text>
+  <text x="50" y="150" class="mu" font-size="13">admin EC2 host, CI job or laptop</text>
+
+  <rect x="50" y="168" width="290" height="70" rx="6" fill="#FFFFFF" stroke="#E7157B" stroke-width="2"/>
+  <text x="66" y="194" class="t" font-size="15" font-weight="700">Scheduler</text>
+  <text x="66" y="218" class="mono">cron.d / systemd timer, UTC</text>
+
+  <rect x="50" y="256" width="290" height="160" rx="6" fill="#FFFFFF" stroke="#232F3E" stroke-width="2"/>
+  <text x="66" y="282" class="t" font-size="15" font-weight="700">bin/ebs-snapshot-backup</text>
+  <text x="66" y="306" class="monos">lock per policy (mkdir, stale pid)</text>
+  <text x="66" y="326" class="monos">--region / --all-regions</text>
+  <text x="66" y="346" class="monos">--tag Backup=true</text>
+  <text x="66" y="366" class="monos">--retention-days 30 --keep-min 1</text>
+  <text x="66" y="386" class="monos">--dry-run = EC2 DryRun flag</text>
+  <text x="66" y="406" class="monos">timeouts 5 s / 30 s, adaptive retry</text>
+
+  <rect x="50" y="434" width="290" height="80" rx="6" fill="#FFFFFF" stroke="#545B64" stroke-width="2"/>
+  <text x="66" y="458" class="t" font-size="15" font-weight="700">Outputs</text>
+  <text x="66" y="480" class="monos">stderr logs: text or JSON lines</text>
+  <text x="66" y="500" class="monos">--report run.json · exit 0 / 1 / 2 / 3</text>
+
+  <path class="solid" d="M195,238 L195,256" marker-end="url(#arrow)"/>
+
+  <!-- ===== IAM ===== -->
+  <rect x="30" y="560" width="330" height="310" rx="8" fill="#FFFFFF" stroke="#DD344C" stroke-width="2"/>
+  <text x="50" y="590" class="t" font-size="17" font-weight="700">IAM policy (iam/)</text>
+  <text x="50" y="612" class="mu" font-size="13">instance profile or assumed role</text>
+  <text x="50" y="640" class="monos">Describe* on *</text>
+  <text x="50" y="664" class="monos">CreateSnapshot: only with request tag</text>
+  <text x="50" y="682" class="monos">  ebs-backup:managed-by</text>
+  <text x="50" y="706" class="monos">CreateTags: only while creating</text>
+  <text x="50" y="724" class="monos">  (ec2:CreateAction = CreateSnapshot)</text>
+  <text x="50" y="748" class="monos">DeleteSnapshot: only resource tag</text>
+  <text x="50" y="766" class="monos">  ebs-backup:managed-by</text>
+  <text x="50" y="790" class="monos" fill="#D13212">Deny DeleteSnapshot if DoNotDelete</text>
+  <text x="50" y="822" class="mu" font-size="13">The script rules are enforced twice:</text>
+  <text x="50" y="842" class="mu" font-size="13">in code and by IAM (proven in e2e).</text>
+
+  <!-- ===== AWS region ===== -->
+  <rect x="400" y="100" width="970" height="770" rx="8" fill="#FFFFFF" stroke="#00A4A6" stroke-width="2" stroke-dasharray="8 5"/>
+  <text x="420" y="130" class="t" font-size="17" font-weight="700">AWS account · each selected region, one after another</text>
+
+  <!-- step 1: list managed -->
+  <circle cx="440" cy="172" r="14" fill="#232F3E"/><text x="435" y="177" class="step">1</text>
+  <text x="464" y="168" class="t" font-size="14" font-weight="700">DescribeSnapshots owner=self, tag managed-by + policy</text>
+  <text x="464" y="188" class="monos">one call: feeds both "already done today?" and the retention plan</text>
+
+  <!-- step 2: discover -->
+  <circle cx="440" cy="226" r="14" fill="#232F3E"/><text x="435" y="231" class="step">2</text>
+  <text x="464" y="222" class="t" font-size="14" font-weight="700">DescribeInstances state=running, tag:Backup=true</text>
+  <text x="464" y="242" class="monos">BlockDeviceMappings[].Ebs.VolumeId, multi-attach de-duplicated · DescribeVolumes for tags</text>
+
+  <!-- EC2 fleet -->
+  <rect x="420" y="270" width="520" height="200" rx="6" fill="#FFFFFF" stroke="#ED7100" stroke-width="2"/>
+  <text x="436" y="296" class="t" font-size="15" font-weight="700">Amazon EC2</text>
+
+  <rect x="436" y="310" width="150" height="140" rx="5" fill="#FFF4E8" stroke="#ED7100" stroke-width="1.6"/>
+  <text x="448" y="332" class="t" font-size="13" font-weight="700">web-1  running</text>
+  <text x="448" y="350" class="monos">Backup=true</text>
+  <rect x="448" y="362" width="126" height="34" rx="4" fill="#FFFFFF" stroke="#7AA116" stroke-width="1.6"/>
+  <text x="458" y="384" class="monos">root /dev/xvda</text>
+  <rect x="448" y="404" width="126" height="34" rx="4" fill="#FFFFFF" stroke="#7AA116" stroke-width="1.6"/>
+  <text x="458" y="426" class="monos">data /dev/sdf</text>
+
+  <rect x="600" y="310" width="150" height="140" rx="5" fill="#F2F3F3" stroke="#879196" stroke-width="1.6"/>
+  <text x="612" y="332" class="t" font-size="13" font-weight="700">batch  running</text>
+  <text x="612" y="350" class="monos">Backup=false</text>
+  <text x="612" y="400" class="mu" font-size="13">ignored:</text>
+  <text x="612" y="418" class="mu" font-size="13">selector tag</text>
+
+  <rect x="764" y="310" width="160" height="140" rx="5" fill="#F2F3F3" stroke="#879196" stroke-width="1.6"/>
+  <text x="776" y="332" class="t" font-size="13" font-weight="700">old-db  stopped</text>
+  <text x="776" y="350" class="monos">Backup=true</text>
+  <text x="776" y="400" class="mu" font-size="13">ignored:</text>
+  <text x="776" y="418" class="mu" font-size="13">not running</text>
+
+  <!-- step 3: create -->
+  <circle cx="1000" cy="300" r="14" fill="#3F8624"/><text x="995" y="305" class="step">3</text>
+  <text x="1022" y="296" class="t" font-size="14" font-weight="700">CreateSnapshot per volume</text>
+  <text x="1022" y="316" class="monos">skip if today's copy exists</text>
+  <text x="1022" y="334" class="monos">--tag-specifications at create</text>
+  <path class="green" d="M511,450 L511,492 L1150,492 L1150,518" marker-end="url(#arrowGreen)"/>
+  <text x="980" y="486" class="monos" fill="#3F8624">snapshot each volume</text>
+
+  <!-- Snapshots store -->
+  <rect x="960" y="520" width="390" height="240" rx="6" fill="#FFFFFF" stroke="#7AA116" stroke-width="2"/>
+  <text x="976" y="546" class="t" font-size="15" font-weight="700">EBS snapshots (this policy)</text>
+  <text x="976" y="568" class="monos">ebs-backup:managed-by = ebs-snapshot-backup</text>
+  <text x="976" y="586" class="monos">ebs-backup:policy = daily</text>
+  <text x="976" y="604" class="monos">ebs-backup:volume-id / instance-id / device</text>
+  <text x="976" y="622" class="monos">ebs-backup:backup-date = 2026-10-24 (UTC)</text>
+  <text x="976" y="640" class="monos">+ copied volume tags (owner, CostCenter)</text>
+
+  <rect x="976" y="656" width="110" height="28" rx="4" fill="#E9F3E2" stroke="#7AA116"/><text x="986" y="675" class="monos">day 0 · keep</text>
+  <rect x="1094" y="656" width="110" height="28" rx="4" fill="#E9F3E2" stroke="#7AA116"/><text x="1104" y="675" class="monos">day 12 · keep</text>
+  <rect x="1212" y="656" width="122" height="28" rx="4" fill="#FDECEA" stroke="#D13212"/><text x="1222" y="675" class="monos">day 31 · delete</text>
+  <rect x="976" y="692" width="170" height="28" rx="4" fill="#FFF8E1" stroke="#B7791F"/><text x="986" y="711" class="monos">DoNotDelete · keep</text>
+  <rect x="1154" y="692" width="180" height="28" rx="4" fill="#FFF8E1" stroke="#B7791F"/><text x="1164" y="711" class="monos">newest completed · keep</text>
+  <text x="976" y="744" class="mu" font-size="12">pending, error or used by an AMI: never deleted</text>
+
+  <!-- step 4: retention -->
+  <circle cx="440" cy="520" r="14" fill="#D13212"/><text x="435" y="525" class="step">4</text>
+  <text x="464" y="516" class="t" font-size="14" font-weight="700">Retention plan (pure jq, no AWS call)</text>
+  <text x="464" y="538" class="monos">per volume, newest first:</text>
+  <text x="464" y="558" class="monos">  younger than N days       keep</text>
+  <text x="464" y="576" class="monos">  not completed             keep</text>
+  <text x="464" y="594" class="monos">  newest --keep-min done    keep</text>
+  <text x="464" y="612" class="monos">  protect tag present       keep</text>
+  <text x="464" y="630" class="monos">  otherwise                 delete</text>
+  <text x="464" y="654" class="monos">--max-deletes: abort the region if over</text>
+
+  <circle cx="440" cy="700" r="14" fill="#D13212"/><text x="435" y="705" class="step">5</text>
+  <text x="464" y="696" class="t" font-size="14" font-weight="700">DeleteSnapshot</text>
+  <text x="464" y="716" class="monos">InUse -&gt; skipped-in-use · NotFound -&gt; already-gone</text>
+  <text x="464" y="734" class="monos">Unauthorized -&gt; denied (exit 3)</text>
+  <path class="red" d="M800,726 L956,726" marker-end="url(#arrowRed)"/>
+
+  <!-- never touched -->
+  <rect x="420" y="770" width="520" height="80" rx="6" fill="#F2F3F3" stroke="#879196" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="436" y="796" class="t" font-size="14" font-weight="700">Never candidates</text>
+  <text x="436" y="818" class="monos">manual snapshots · AMI snapshots · AWS Backup / DLM</text>
+  <text x="436" y="836" class="monos">snapshots of another --policy</text>
+
+  <!-- runner to region -->
+  <path class="solid" d="M340,336 L400,336" marker-end="url(#arrow)"/>
+  <path class="dash" d="M400,474 L340,474" marker-end="url(#arrow)"/>
+</svg>
