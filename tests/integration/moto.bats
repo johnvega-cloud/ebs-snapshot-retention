@@ -32,7 +32,10 @@ teardown_file() {
 
 setup() {
 	if [ -z "${MOTO_URL:-}" ]; then
-		[ "${REQUIRE_MOTO:-0}" != 1 ] || { echo "REQUIRE_MOTO=1 but no moto server" >&2; return 1; }
+		[ "${REQUIRE_MOTO:-0}" != 1 ] || {
+			echo "REQUIRE_MOTO=1 but no moto server" >&2
+			return 1
+		}
 		skip "moto_server not available"
 	fi
 	export AWS_ENDPOINT_URL="$MOTO_URL"
