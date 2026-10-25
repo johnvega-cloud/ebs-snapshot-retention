@@ -53,10 +53,10 @@ run_instance() {
 }
 
 attach_data_volume() { # attach_data_volume INSTANCE DEVICE [TAGS] -> volume id
-	local vol tags=()
-	[ -n "${3:-}" ] && tags=(--tag-specifications "ResourceType=volume,Tags=[$3]")
+	local vol tag_spec=()
+	[ -n "${3:-}" ] && tag_spec=(--tag-specifications "ResourceType=volume,Tags=[$3]")
 	vol=$(aws ec2 create-volume --size 1 --availability-zone us-east-1a \
-		${tags[@]+"${tags[@]}"} --query VolumeId --output text)
+		${tag_spec[@]+"${tag_spec[@]}"} --query VolumeId --output text)
 	aws ec2 attach-volume --volume-id "$vol" --instance-id "$1" --device "$2" >/dev/null
 	echo "$vol"
 }

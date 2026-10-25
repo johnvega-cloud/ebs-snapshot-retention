@@ -155,7 +155,9 @@ EOF
 
 # ------------------------------------------------------------------- args ----
 _need_value() {
-	[ $# -ge 2 ] && [ -n "$2" ] || usage_error "option $1 needs a value"
+	if [ $# -lt 2 ] || [ -z "$2" ]; then
+		usage_error "option $1 needs a value"
+	fi
 }
 
 _is_uint() {
@@ -197,7 +199,9 @@ parse_args() {
 			;;
 		-d | --retention-days)
 			_need_value "$@"
-			_is_uint "$2" && [ "$2" -ge 1 ] || usage_error "--retention-days must be an integer >= 1"
+			if ! _is_uint "$2" || [ "$2" -lt 1 ]; then
+				usage_error "--retention-days must be an integer >= 1"
+			fi
 			RETENTION_DAYS=$2
 			shift 2
 			;;
@@ -409,13 +413,14 @@ load_volume_tags() {
 	echo '{}' >"$WORKDIR/$region.voltags.json"
 	$COPY_TAGS || return 0
 	# EC2 accepts at most 200 values per filter: query in chunks of 150.
+	# (Slicing by hand: jq 1.8 removed the undocumented _nwise.)
 	while IFS= read -r ids; do
 		aws_ec2 "$region" "$WORKDIR/$region.volumes.json" describe-volumes \
 			--filters "Name=volume-id,Values=$ids" || return 1
 		jq -s '.[0] + ([.[1].Volumes[] | {key: .VolumeId, value: (.Tags // [])}] | from_entries)' \
 			"$WORKDIR/$region.voltags.json" "$WORKDIR/$region.volumes.json" >"$WORKDIR/voltags.tmp"
 		mv "$WORKDIR/voltags.tmp" "$WORKDIR/$region.voltags.json"
-	done < <(jq -r 'map(.volume_id) | _nwise(150) | join(",")' "$WORKDIR/$region.targets.json")
+	done < <(jq -r 'map(.volume_id) | . as $ids | range(0; length; 150) | $ids[.:. + 150] | join(",")' "$WORKDIR/$region.targets.json")
 }
 
 # Writes $WORKDIR/<region>.managed.json: this policy's snapshots, normalised:

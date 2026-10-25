@@ -146,6 +146,20 @@ status_of() { # status_of ID -> status recorded in the report
 	[ "$(calls create-snapshot | wc -l | tr -d ' ')" -eq 1 ]
 }
 
+@test "volume tags are read in chunks of at most 150 ids" {
+	vols=$(jq -rn '[range(151) | "vol-\(.)=/dev/sd\(.)"] | join(",")')
+	instances "i-1:web:$vols" >"$STUB_DIR/describe-instances.out"
+	run "$SCRIPT" --mode snapshot
+	[ "$status" -eq 0 ]
+	[ "$(calls describe-volumes | wc -l | tr -d ' ')" -eq 2 ]
+	first=$(calls describe-volumes | sed -n 1p | sed 's/.*Values=\([^ ]*\).*/\1/')
+	second=$(calls describe-volumes | sed -n 2p | sed 's/.*Values=\([^ ]*\).*/\1/')
+	[ "$(tr ',' '\n' <<<"$first" | wc -l | tr -d ' ')" -eq 150 ]
+	[[ "$second" == vol-* && "$second" != *,* ]] || false
+	[ "$(tr ',' '\n' <<<"$first,$second" | sort -u | wc -l | tr -d ' ')" -eq 151 ]
+	[ "$(calls create-snapshot | wc -l | tr -d ' ')" -eq 151 ]
+}
+
 @test "one failing volume does not stop the others, exit 3" {
 	instances "i-1:web:vol-a=/dev/xvda,vol-b=/dev/sdf,vol-c=/dev/sdg" >"$STUB_DIR/describe-instances.out"
 	aws_err SnapshotCreationPerVolumeRateExceeded >"$STUB_DIR/create-snapshot@vol-b.err"

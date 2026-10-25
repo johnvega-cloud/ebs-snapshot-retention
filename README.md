@@ -166,7 +166,7 @@ bin/ebs-snapshot-backup --tag Backup=true,True,yes
 ## Testing
 
 ```bash
-bats tests/unit                 # 68 tests, fake `aws` on PATH, no network
+bats tests/unit                 # 69 tests, fake `aws` on PATH, no network
 pip install 'moto[server]'
 bats tests/integration          # 11 tests, real AWS CLI against moto's EC2
 shellcheck -x bin/ebs-snapshot-backup && shfmt -d bin tests
