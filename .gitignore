@@ -15,7 +15,7 @@ override.tf.json
 *_override.tf.json
 
 # --- Run output: reports and logs hold account, volume and snapshot IDs ---
-e2e/aws/e2e-out/
+e2e/aws/e2e-out*/
 e2e/aws/e2e-out-console.txt
 *.report.json
 report.json

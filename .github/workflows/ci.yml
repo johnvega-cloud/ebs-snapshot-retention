@@ -1,0 +1,89 @@
+---
+# CI: lint, unit tests on Linux (bash 5) and macOS (bash 3.2), and integration
+# tests with the real AWS CLI against moto. Nothing here touches AWS.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SHFMT_VERSION: v3.12.0
+
+jobs:
+  lint:
+    name: shellcheck + shfmt + policy + terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install shfmt
+        run: |
+          curl -fsSL -o /usr/local/bin/shfmt \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          chmod +x /usr/local/bin/shfmt
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -x bin/ebs-snapshot-backup tests/helpers/bin/aws tests/helpers/common.bash
+          shellcheck -s bash tests/unit/*.bats tests/integration/*.bats
+      - name: shfmt
+        run: shfmt -d bin tests
+      - name: IAM policy is valid JSON
+        run: jq -e '.Version == "2012-10-17"' iam/ebs-snapshot-backup-policy.json
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: terraform fmt + validate (e2e harness)
+        working-directory: e2e/aws
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+  unit:
+    name: unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu: bash 5. macos: /bin/bash 3.2, the oldest bash the script supports.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install bats
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install bats-core jq; else sudo apt-get update -q && sudo apt-get install -y -q bats jq; fi
+      - name: Versions
+        run: |
+          bash --version | head -1
+          jq --version
+          bats --version
+      - run: bats tests/unit
+
+  integration:
+    name: integration (AWS CLI + moto)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install moto server and bats
+        run: |
+          pip install 'moto[server]'
+          sudo apt-get update -q && sudo apt-get install -y -q bats
+      - name: Versions
+        run: |
+          aws --version
+          python -c 'import moto; print("moto", moto.__version__)'
+      - run: bats tests/integration
+        env:
+          REQUIRE_MOTO: "1"

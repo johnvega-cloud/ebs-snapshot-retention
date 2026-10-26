@@ -1,0 +1,692 @@
+#!/usr/bin/env bash
+# ebs-snapshot-backup: snapshot every EBS volume attached to running EC2
+# instances that carry a backup tag (default Backup=true), then delete the
+# snapshots this tool created that are older than the retention period.
+#
+# Safety model:
+#   * It only ever deletes snapshots it created itself: they carry the tag
+#     ebs-backup:managed-by=ebs-snapshot-backup and the same --policy name.
+#     Manual snapshots, AMI snapshots and AWS Backup / DLM snapshots are never
+#     candidates. The IAM policy in iam/ enforces the same rule.
+#   * The newest --keep-min completed snapshots of every volume are kept even
+#     when they are past retention (a volume that stopped being backed up does
+#     not lose its last copy).
+#   * Snapshots tagged DoNotDelete, still pending, or used by an AMI are kept.
+#   * --dry-run sends every create/delete with the EC2 DryRun flag: nothing
+#     changes, but AWS still checks the permissions.
+#   * Re-running on the same day is a no-op: one snapshot per volume, per
+#     policy, per UTC day.
+#
+# Requires: bash >= 3.2, AWS CLI v2, jq >= 1.6.
+# Exit codes: 0 ok, 1 fatal (dependencies, credentials, lock), 2 usage,
+#             3 finished with failures (some volume, snapshot or region).
+
+set -o errexit -o nounset -o pipefail
+
+readonly VERSION="1.0.0"
+readonly PROG="ebs-snapshot-backup"
+readonly MANAGED_BY="ebs-snapshot-backup"
+readonly TAG_PREFIX="ebs-backup:"
+
+# ---------------------------------------------------------------- defaults ---
+REGIONS=()
+ALL_REGIONS=false
+SELECTOR_KEY="Backup"
+SELECTOR_VALUES="true"
+RETENTION_DAYS=30
+KEEP_MIN=1
+POLICY="default"
+MODE="all" # all | snapshot | prune
+DRY_RUN=false
+COPY_TAGS=true
+PROTECT_TAG="DoNotDelete"
+MAX_DELETES=0 # per region, 0 = no limit
+WAIT=false
+WAIT_TIMEOUT=1800
+LOG_FORMAT="text"
+LOG_LEVEL="info"
+REPORT_FILE=""
+LOCK_PATH=""
+
+# Bounded network behaviour: a dead regional endpoint must fail in seconds,
+# not stall a cron job (botocore defaults are 60 s connect, retried).
+CONNECT_TIMEOUT="${EBS_BACKUP_CONNECT_TIMEOUT:-5}"
+READ_TIMEOUT="${EBS_BACKUP_READ_TIMEOUT:-30}"
+POLL_SECONDS="${EBS_BACKUP_POLL_SECONDS:-15}"
+export AWS_RETRY_MODE="${AWS_RETRY_MODE:-adaptive}"
+export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-8}"
+export AWS_PAGER=""
+
+# ------------------------------------------------------------------ state ----
+WORKDIR=""
+RESULTS_FILE=""
+RUN_ID=""
+NOW_EPOCH=""
+TODAY=""
+AWS_ERR_CODE=""
+AWS_ERR_MSG=""
+LOCK_HELD=false
+
+# ---------------------------------------------------------------- logging ----
+_level_num() {
+	case "$1" in
+	debug) echo 10 ;;
+	info) echo 20 ;;
+	warn) echo 30 ;;
+	error) echo 40 ;;
+	*) echo 20 ;;
+	esac
+}
+
+# log LEVEL MESSAGE [key=value ...]  -> stderr, text or JSON lines
+log() {
+	local level=$1 msg=$2 ts kv
+	shift 2
+	[ "$(_level_num "$level")" -ge "$(_level_num "$LOG_LEVEL")" ] || return 0
+	ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	if [ "$LOG_FORMAT" = "json" ]; then
+		jq -cn --arg ts "$ts" --arg level "$level" --arg msg "$msg" --arg run "$RUN_ID" \
+			'$ARGS.positional
+			 | map(capture("^(?<k>[^=]+)=(?<v>.*)$"))
+			 | map({(.k): .v}) | add // {}
+			 | {ts: $ts, level: $level, msg: $msg, run_id: $run} + .' \
+			--args "$@" >&2
+	else
+		kv=""
+		[ $# -gt 0 ] && kv=" $*"
+		printf '%s %-5s %s%s\n' "$ts" "$(echo "$level" | tr '[:lower:]' '[:upper:]')" "$msg" "$kv" >&2
+	fi
+}
+
+die() {
+	log error "$1"
+	exit "${2:-1}"
+}
+
+usage_error() {
+	echo "$PROG: $1" >&2
+	echo "Try '$PROG --help'." >&2
+	exit 2
+}
+
+usage() {
+	cat <<EOF
+Usage: $PROG [options]
+
+Snapshot the EBS volumes of running instances tagged ${SELECTOR_KEY}=${SELECTOR_VALUES},
+then delete this tool's snapshots older than the retention period.
+
+Scope:
+  -r, --region REGION        Region to process (repeatable). Default: AWS_REGION,
+                             AWS_DEFAULT_REGION or the profile's region.
+      --all-regions          Every region enabled in the account.
+  -t, --tag KEY=VALUES       Instance selector (default: Backup=true). VALUES is a
+                             comma-separated list, e.g. Backup=true,True,yes.
+  -p, --policy NAME          Backup policy name (default: default). Snapshots are
+                             tagged with it; retention only touches its own
+                             policy, so daily/7d and monthly/365d can coexist.
+
+Retention:
+  -d, --retention-days N     Delete managed snapshots older than N days (default: 30).
+      --keep-min N           Always keep the newest N completed snapshots per
+                             volume (default: 1; 0 disables).
+      --protect-tag KEY      Never delete snapshots carrying this tag key
+                             (default: DoNotDelete).
+      --max-deletes N        Abort pruning a region that would delete more than N
+                             snapshots (default: 0 = no limit).
+
+Behaviour:
+      --mode MODE            all | snapshot | prune (default: all).
+  -n, --dry-run              Use the EC2 DryRun flag: nothing changes, but AWS
+                             checks every permission.
+      --no-copy-tags         Do not copy the volume's tags to its snapshot.
+      --wait                 Wait for new snapshots to complete (fails on error state).
+      --wait-timeout SECONDS Give up waiting after SECONDS (default: 1800).
+      --report FILE          Write a JSON report of the run to FILE.
+      --lock-file PATH       Lock directory (default: \$TMPDIR/$PROG-<policy>.lock).
+      --log-format FORMAT    text | json (default: text). Logs go to stderr.
+  -v, --verbose              Debug logging.
+  -h, --help                 Show this help.
+      --version              Show the version.
+
+Exit codes: 0 ok, 1 fatal error, 2 usage error, 3 finished with failures.
+EOF
+}
+
+# ------------------------------------------------------------------- args ----
+_need_value() {
+	if [ $# -lt 2 ] || [ -z "$2" ]; then
+		usage_error "option $1 needs a value"
+	fi
+}
+
+_is_uint() {
+	case "$1" in
+	'' | *[!0-9]*) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
+parse_args() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-r | --region)
+			_need_value "$@"
+			REGIONS+=("$2")
+			shift 2
+			;;
+		--all-regions)
+			ALL_REGIONS=true
+			shift
+			;;
+		-t | --tag)
+			_need_value "$@"
+			case "$2" in
+			?*=?*) ;;
+			*) usage_error "--tag must look like KEY=VALUE[,VALUE...]" ;;
+			esac
+			SELECTOR_KEY=${2%%=*}
+			SELECTOR_VALUES=${2#*=}
+			shift 2
+			;;
+		-p | --policy)
+			_need_value "$@"
+			case "$2" in
+			*[!A-Za-z0-9_.-]*) usage_error "--policy may only contain letters, digits, '.', '_' and '-'" ;;
+			esac
+			POLICY=$2
+			shift 2
+			;;
+		-d | --retention-days)
+			_need_value "$@"
+			if ! _is_uint "$2" || [ "$2" -lt 1 ]; then
+				usage_error "--retention-days must be an integer >= 1"
+			fi
+			RETENTION_DAYS=$2
+			shift 2
+			;;
+		--keep-min)
+			_need_value "$@"
+			_is_uint "$2" || usage_error "--keep-min must be an integer >= 0"
+			KEEP_MIN=$2
+			shift 2
+			;;
+		--protect-tag)
+			_need_value "$@"
+			PROTECT_TAG=$2
+			shift 2
+			;;
+		--max-deletes)
+			_need_value "$@"
+			_is_uint "$2" || usage_error "--max-deletes must be an integer >= 0"
+			MAX_DELETES=$2
+			shift 2
+			;;
+		--mode)
+			_need_value "$@"
+			case "$2" in
+			all | snapshot | prune) MODE=$2 ;;
+			*) usage_error "--mode must be all, snapshot or prune" ;;
+			esac
+			shift 2
+			;;
+		-n | --dry-run)
+			DRY_RUN=true
+			shift
+			;;
+		--no-copy-tags)
+			COPY_TAGS=false
+			shift
+			;;
+		--wait)
+			WAIT=true
+			shift
+			;;
+		--wait-timeout)
+			_need_value "$@"
+			_is_uint "$2" || usage_error "--wait-timeout must be a number of seconds"
+			WAIT_TIMEOUT=$2
+			shift 2
+			;;
+		--report)
+			_need_value "$@"
+			REPORT_FILE=$2
+			shift 2
+			;;
+		--lock-file)
+			_need_value "$@"
+			LOCK_PATH=$2
+			shift 2
+			;;
+		--log-format)
+			_need_value "$@"
+			case "$2" in
+			text | json) LOG_FORMAT=$2 ;;
+			*) usage_error "--log-format must be text or json" ;;
+			esac
+			shift 2
+			;;
+		-v | --verbose)
+			LOG_LEVEL=debug
+			shift
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		--version)
+			echo "$PROG $VERSION"
+			exit 0
+			;;
+		*) usage_error "unknown option: $1" ;;
+		esac
+	done
+
+	if $ALL_REGIONS && [ ${#REGIONS[@]} -gt 0 ]; then
+		usage_error "--region and --all-regions are mutually exclusive"
+	fi
+}
+
+# --------------------------------------------------------------- aws calls ---
+# aws_ec2 REGION OUTFILE ARGS...
+# Runs `aws ec2 ARGS` with bounded timeouts. stdout goes to OUTFILE. On failure
+# AWS_ERR_CODE holds the EC2 error code (e.g. InvalidSnapshot.InUse) and the
+# function returns the CLI exit status. No subshell, so the globals survive.
+aws_ec2() {
+	local region=$1 outfile=$2 rc=0
+	shift 2
+	AWS_ERR_CODE=""
+	AWS_ERR_MSG=""
+	log debug "aws ec2 $1" region="$region"
+	aws ec2 "$@" --region "$region" --output json \
+		--cli-connect-timeout "$CONNECT_TIMEOUT" --cli-read-timeout "$READ_TIMEOUT" \
+		>"$outfile" 2>"$WORKDIR/stderr" || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		AWS_ERR_MSG=$(tr '\n' ' ' <"$WORKDIR/stderr" | sed 's/[[:space:]]*$//')
+		AWS_ERR_CODE=$(sed -n 's/.*An error occurred (\([^)]*\)).*/\1/p' "$WORKDIR/stderr" | head -n 1)
+		[ -n "$AWS_ERR_CODE" ] || AWS_ERR_CODE="CliError"
+	fi
+	return "$rc"
+}
+
+# ---------------------------------------------------------------- results ----
+# record STATUS REGION KIND ID [key=value ...]
+# Appends one JSON line to the results file and logs it.
+record() {
+	local status=$1 region=$2 kind=$3 id=$4 level=info
+	shift 4
+	jq -cn --arg status "$status" --arg region "$region" --arg kind "$kind" --arg id "$id" \
+		'$ARGS.positional
+		 | map(capture("^(?<k>[^=]+)=(?<v>.*)$")) | map({(.k): .v}) | add // {}
+		 | {status: $status, region: $region, kind: $kind, id: $id} + .' \
+		--args "$@" >>"$RESULTS_FILE"
+	case "$status" in
+	failed | denied | region-error) level=error ;;
+	skipped-* | aborted) level=warn ;;
+	esac
+	log "$level" "$kind $status" region="$region" id="$id" "$@"
+}
+
+# ------------------------------------------------------------------- lock ----
+acquire_lock() {
+	local pid
+	[ -n "$LOCK_PATH" ] || LOCK_PATH="${TMPDIR:-/tmp}"
+	LOCK_PATH="${LOCK_PATH%/}"
+	case "$LOCK_PATH" in
+	*.lock) ;;
+	*) LOCK_PATH="$LOCK_PATH/$PROG-$POLICY.lock" ;;
+	esac
+	if mkdir "$LOCK_PATH" 2>/dev/null; then
+		echo "$$" >"$LOCK_PATH/pid"
+		LOCK_HELD=true
+		return 0
+	fi
+	pid=$(cat "$LOCK_PATH/pid" 2>/dev/null || true)
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		die "another run holds the lock $LOCK_PATH (pid $pid)"
+	fi
+	log warn "removing stale lock" path="$LOCK_PATH" pid="${pid:-unknown}"
+	rm -rf "$LOCK_PATH"
+	mkdir "$LOCK_PATH" 2>/dev/null || die "could not take the lock $LOCK_PATH"
+	echo "$$" >"$LOCK_PATH/pid"
+	LOCK_HELD=true
+}
+
+cleanup() {
+	if $LOCK_HELD; then rm -rf "$LOCK_PATH"; fi
+	if [ -n "$WORKDIR" ]; then rm -rf "$WORKDIR"; fi
+}
+
+# ----------------------------------------------------------------- setup -----
+preflight() {
+	command -v aws >/dev/null 2>&1 || die "aws CLI not found in PATH"
+	command -v jq >/dev/null 2>&1 || die "jq not found in PATH"
+	jq -n '"2026-01-01T00:00:00Z" | fromdateiso8601' >/dev/null 2>&1 || die "jq >= 1.6 is required"
+
+	NOW_EPOCH="${EBS_BACKUP_NOW:-$(date +%s)}"
+	_is_uint "$NOW_EPOCH" || die "EBS_BACKUP_NOW must be a Unix timestamp"
+	TODAY=$(jq -rn --argjson e "$NOW_EPOCH" '$e | strftime("%Y-%m-%d")')
+	RUN_ID="$(jq -rn --argjson e "$NOW_EPOCH" '$e | strftime("%Y%m%dT%H%M%SZ")')-$$"
+}
+
+resolve_regions() {
+	local region
+	if $ALL_REGIONS; then
+		region="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}"
+		[ -n "$region" ] || region="us-east-1"
+		aws_ec2 "$region" "$WORKDIR/regions.json" describe-regions ||
+			die "describe-regions failed: $AWS_ERR_MSG"
+		REGIONS=()
+		while IFS= read -r region; do
+			REGIONS+=("$region")
+		done < <(jq -r '.Regions[].RegionName' "$WORKDIR/regions.json" | sort)
+	elif [ ${#REGIONS[@]} -eq 0 ]; then
+		region="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}"
+		[ -n "$region" ] || usage_error "no region: use --region, --all-regions or set AWS_REGION"
+		REGIONS=("$region")
+	fi
+}
+
+# ------------------------------------------------------------- discovery -----
+# Writes $WORKDIR/<region>.targets.json:
+#   [{volume_id, instance_id, instance_name, device}]  (one entry per volume)
+discover_targets() {
+	local region=$1
+	aws_ec2 "$region" "$WORKDIR/$region.instances.json" describe-instances \
+		--filters "Name=instance-state-name,Values=running" \
+		"Name=tag:${SELECTOR_KEY},Values=${SELECTOR_VALUES}" || return 1
+
+	# A multi-attach volume shows up under every instance: keep the first.
+	jq '[.Reservations[].Instances[]
+	     | (.Tags // [] | map(select(.Key == "Name")) | first | .Value // "") as $name
+	     | .InstanceId as $iid
+	     | .BlockDeviceMappings[]? | select(.Ebs.VolumeId != null)
+	     | {volume_id: .Ebs.VolumeId, instance_id: $iid, instance_name: $name, device: .DeviceName}]
+	    | unique_by(.volume_id)' "$WORKDIR/$region.instances.json" >"$WORKDIR/$region.targets.json"
+}
+
+# Writes $WORKDIR/<region>.voltags.json: {"vol-1": [{Key,Value}...], ...}
+# Volumes deleted since discovery are simply absent (a filter, not --volume-ids,
+# so one vanished volume does not fail the whole call).
+load_volume_tags() {
+	local region=$1 ids
+	echo '{}' >"$WORKDIR/$region.voltags.json"
+	$COPY_TAGS || return 0
+	# EC2 accepts at most 200 values per filter: query in chunks of 150.
+	# (Slicing by hand: jq 1.8 removed the undocumented _nwise.)
+	while IFS= read -r ids; do
+		aws_ec2 "$region" "$WORKDIR/$region.volumes.json" describe-volumes \
+			--filters "Name=volume-id,Values=$ids" || return 1
+		jq -s '.[0] + ([.[1].Volumes[] | {key: .VolumeId, value: (.Tags // [])}] | from_entries)' \
+			"$WORKDIR/$region.voltags.json" "$WORKDIR/$region.volumes.json" >"$WORKDIR/voltags.tmp"
+		mv "$WORKDIR/voltags.tmp" "$WORKDIR/$region.voltags.json"
+	done < <(jq -r 'map(.volume_id) | . as $ids | range(0; length; 150) | $ids[.:. + 150] | join(",")' "$WORKDIR/$region.targets.json")
+}
+
+# Writes $WORKDIR/<region>.managed.json: this policy's snapshots, normalised:
+#   [{snapshot_id, volume_id, backup_date, state, start_epoch, protected}]
+load_managed_snapshots() {
+	local region=$1
+	aws_ec2 "$region" "$WORKDIR/$region.snapshots.json" describe-snapshots \
+		--owner-ids self \
+		--filters "Name=tag:${TAG_PREFIX}managed-by,Values=${MANAGED_BY}" \
+		"Name=tag:${TAG_PREFIX}policy,Values=${POLICY}" || return 1
+	jq --arg prefix "$TAG_PREFIX" --arg protect "$PROTECT_TAG" '
+	  def epoch: sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601;
+	  [.Snapshots[]
+	   | (.Tags // [] | from_entries) as $t
+	   | {snapshot_id: .SnapshotId,
+	      volume_id: ($t[$prefix + "volume-id"] // .VolumeId),
+	      backup_date: ($t[$prefix + "backup-date"] // ""),
+	      state: .State,
+	      start_epoch: (.StartTime | epoch),
+	      protected: ($t | has($protect))}]' \
+		"$WORKDIR/$region.snapshots.json" >"$WORKDIR/$region.managed.json"
+}
+
+# ---------------------------------------------------------------- snapshot ---
+snapshot_tags_json() {
+	local region=$1 target=$2
+	jq -c --argjson target "$target" --slurpfile voltags "$WORKDIR/$region.voltags.json" \
+		--arg prefix "$TAG_PREFIX" --arg managed "$MANAGED_BY" --arg policy "$POLICY" \
+		--arg date "$TODAY" --arg run "$RUN_ID" --arg sel "$SELECTOR_KEY" -n '
+	  ($target.instance_name | if . == "" then $target.instance_id else . end) as $who
+	  | [{Key: ($prefix + "managed-by"), Value: $managed},
+	     {Key: ($prefix + "policy"), Value: $policy},
+	     {Key: ($prefix + "volume-id"), Value: $target.volume_id},
+	     {Key: ($prefix + "instance-id"), Value: $target.instance_id},
+	     {Key: ($prefix + "device"), Value: $target.device},
+	     {Key: ($prefix + "backup-date"), Value: $date},
+	     {Key: ($prefix + "run-id"), Value: $run},
+	     {Key: "Name", Value: ("\($who) \($target.device) \($date)")}] as $own
+	  # Copy the volume tags (owner, cost centre...) except AWS-reserved ones,
+	  # our own namespace, Name (ours wins) and the selector tag. Max 50 tags.
+	  | ($voltags[0][$target.volume_id] // []
+	     | map(select((.Key | startswith("aws:") or startswith($prefix)) | not)
+	           | select(.Key != "Name" and .Key != $sel))) as $copied
+	  | [{ResourceType: "snapshot", Tags: ($own + $copied)[:50]}]'
+}
+
+snapshot_volume() {
+	local region=$1 target=$2 volume instance device existing tags desc snap
+	volume=$(jq -r '.volume_id' <<<"$target")
+	instance=$(jq -r '.instance_id' <<<"$target")
+	device=$(jq -r '.device' <<<"$target")
+
+	# Idempotency: one snapshot per volume, per policy, per UTC day.
+	existing=$(jq -r --arg v "$volume" --arg d "$TODAY" \
+		'map(select(.volume_id == $v and .backup_date == $d and .state != "error")) | first | .snapshot_id // ""' \
+		"$WORKDIR/$region.managed.json")
+	if [ -n "$existing" ]; then
+		record exists "$region" volume "$volume" snapshot="$existing" instance="$instance"
+		return 0
+	fi
+
+	tags=$(snapshot_tags_json "$region" "$target")
+	desc="$MANAGED_BY policy=$POLICY instance=$instance device=$device date=$TODAY"
+
+	if $DRY_RUN; then
+		if aws_ec2 "$region" "$WORKDIR/out.json" create-snapshot --dry-run \
+			--volume-id "$volume" --description "$desc" --tag-specifications "$tags" ||
+			[ "$AWS_ERR_CODE" = "DryRunOperation" ]; then
+			record would-create "$region" volume "$volume" instance="$instance" device="$device"
+		else
+			_record_failure "$region" volume "$volume" instance="$instance"
+		fi
+		return 0
+	fi
+
+	if aws_ec2 "$region" "$WORKDIR/out.json" create-snapshot \
+		--volume-id "$volume" --description "$desc" --tag-specifications "$tags"; then
+		snap=$(jq -r '.SnapshotId' "$WORKDIR/out.json")
+		echo "$snap" >>"$WORKDIR/$region.created"
+		record created "$region" volume "$volume" snapshot="$snap" instance="$instance" device="$device"
+	else
+		_record_failure "$region" volume "$volume" instance="$instance"
+	fi
+}
+
+_record_failure() {
+	local region=$1 kind=$2 id=$3 status=failed
+	shift 3
+	case "$AWS_ERR_CODE" in
+	UnauthorizedOperation | AccessDenied*) status=denied ;;
+	esac
+	record "$status" "$region" "$kind" "$id" error="$AWS_ERR_CODE" "$@" message="$AWS_ERR_MSG"
+}
+
+snapshot_region() {
+	local region=$1 count target
+	: >"$WORKDIR/$region.created"
+	count=$(jq 'length' "$WORKDIR/$region.targets.json")
+	log info "volumes to back up" region="$region" count="$count" selector="${SELECTOR_KEY}=${SELECTOR_VALUES}"
+	while IFS= read -r target; do
+		snapshot_volume "$region" "$target"
+	done < <(jq -c '.[]' "$WORKDIR/$region.targets.json")
+	if $WAIT && ! $DRY_RUN && [ -s "$WORKDIR/$region.created" ]; then
+		wait_for_snapshots "$region"
+	fi
+}
+
+# Polls until every snapshot created in this region is completed or errored,
+# or the timeout passes (then they are reported, not failed: still pending).
+wait_for_snapshots() {
+	local region=$1 deadline ids pending snap state message
+	deadline=$(($(date +%s) + WAIT_TIMEOUT))
+	ids=$(tr '\n' ' ' <"$WORKDIR/$region.created")
+	while :; do
+		# shellcheck disable=SC2086 # word splitting on ids is intended
+		if ! aws_ec2 "$region" "$WORKDIR/wait.json" describe-snapshots --snapshot-ids $ids; then
+			log warn "could not poll snapshot state" region="$region" error="$AWS_ERR_CODE"
+			return 0
+		fi
+		pending=$(jq '[.Snapshots[] | select(.State == "pending")] | length' "$WORKDIR/wait.json")
+		[ "$pending" -eq 0 ] && break
+		if [ "$(date +%s)" -ge "$deadline" ]; then
+			log warn "wait timeout, snapshots still pending" region="$region" pending="$pending"
+			break
+		fi
+		sleep "$POLL_SECONDS"
+	done
+	while IFS=$'\t' read -r snap state message; do
+		if [ "$state" = "error" ]; then
+			record failed "$region" snapshot "$snap" error=SnapshotStateError message="$message"
+		else
+			record "$state" "$region" snapshot "$snap"
+		fi
+	done < <(jq -r '.Snapshots[] | select(.State != "pending") | [.SnapshotId, .State, (.StateMessage // "")] | @tsv' "$WORKDIR/wait.json")
+}
+
+# ------------------------------------------------------------------ prune ----
+# Decides, for every managed snapshot, keep or delete. Pure jq, no AWS calls:
+# the rules are tested directly (see tests/unit/prune_plan.bats).
+prune_plan() {
+	local managed_file=$1
+	jq -c --argjson now "$NOW_EPOCH" --argjson days "$RETENTION_DAYS" --argjson keep "$KEEP_MIN" '
+	  ($now - $days * 86400) as $cutoff
+	  | group_by(.volume_id)[]
+	  | sort_by(.start_epoch) | reverse
+	  | (map(select(.state == "completed")) | .[:$keep] | map(.snapshot_id)) as $newest
+	  | .[]
+	  | . + {age_days: ((($now - .start_epoch) / 86400) | floor)}
+	  | . + {decision: (
+	      if .start_epoch > $cutoff then "keep-young"
+	      elif .state != "completed" then "keep-not-completed"
+	      elif (.snapshot_id | IN($newest[])) then "keep-min"
+	      elif .protected then "keep-protected"
+	      else "delete" end)}' "$managed_file"
+}
+
+prune_region() {
+	local region=$1 decision snap volume age to_delete
+	prune_plan "$WORKDIR/$region.managed.json" >"$WORKDIR/$region.plan.jsonl"
+	to_delete=$(grep -c '"decision":"delete"' "$WORKDIR/$region.plan.jsonl" || true)
+	log info "retention" region="$region" managed="$(wc -l <"$WORKDIR/$region.plan.jsonl" | tr -d ' ')" \
+		to_delete="$to_delete" retention_days="$RETENTION_DAYS" keep_min="$KEEP_MIN"
+
+	if [ "$MAX_DELETES" -gt 0 ] && [ "$to_delete" -gt "$MAX_DELETES" ]; then
+		record aborted "$region" region "$region" reason="would delete $to_delete snapshots, limit is $MAX_DELETES"
+		echo 1 >"$WORKDIR/failed"
+		return 0
+	fi
+
+	while IFS=$'\t' read -r decision snap volume age; do
+		case "$decision" in
+		delete) delete_snapshot "$region" "$snap" "$volume" "$age" ;;
+		keep-min | keep-protected) record "kept" "$region" snapshot "$snap" volume="$volume" age_days="$age" reason="${decision#keep-}" ;;
+		*) log debug "snapshot kept" region="$region" id="$snap" reason="${decision#keep-}" ;;
+		esac
+	done < <(jq -r '[.decision, .snapshot_id, .volume_id, .age_days] | @tsv' "$WORKDIR/$region.plan.jsonl")
+}
+
+delete_snapshot() {
+	local region=$1 snap=$2 volume=$3 age=$4 dry=()
+	$DRY_RUN && dry=(--dry-run)
+	if aws_ec2 "$region" "$WORKDIR/out.json" delete-snapshot ${dry[@]+"${dry[@]}"} --snapshot-id "$snap"; then
+		record deleted "$region" snapshot "$snap" volume="$volume" age_days="$age"
+		return 0
+	fi
+	case "$AWS_ERR_CODE" in
+	DryRunOperation) record would-delete "$region" snapshot "$snap" volume="$volume" age_days="$age" ;;
+	InvalidSnapshot.NotFound) record already-gone "$region" snapshot "$snap" volume="$volume" ;;
+	InvalidSnapshot.InUse) record skipped-in-use "$region" snapshot "$snap" volume="$volume" age_days="$age" message="$AWS_ERR_MSG" ;;
+	*) _record_failure "$region" snapshot "$snap" volume="$volume" ;;
+	esac
+}
+
+# ------------------------------------------------------------------- main ----
+process_region() {
+	local region=$1
+	log info "region start" region="$region" policy="$POLICY" mode="$MODE" dry_run="$DRY_RUN"
+	if ! load_managed_snapshots "$region"; then
+		record region-error "$region" region "$region" step=describe-snapshots error="$AWS_ERR_CODE" message="$AWS_ERR_MSG"
+		return 0
+	fi
+	if [ "$MODE" != "prune" ]; then
+		if ! discover_targets "$region"; then
+			record region-error "$region" region "$region" step=describe-instances error="$AWS_ERR_CODE" message="$AWS_ERR_MSG"
+			return 0
+		fi
+		if ! load_volume_tags "$region"; then
+			# Not fatal: snapshots are still taken, just without copied tags.
+			log warn "could not read volume tags, snapshots will not copy them" region="$region" error="$AWS_ERR_CODE"
+			echo '{}' >"$WORKDIR/$region.voltags.json"
+		fi
+		snapshot_region "$region"
+	fi
+	if [ "$MODE" != "snapshot" ]; then
+		prune_region "$region"
+	fi
+}
+
+summarize() {
+	local summary
+	summary=$(jq -sc 'group_by(.status) | map({(.[0].status): length}) | add // {}' "$RESULTS_FILE")
+	if [ -n "$REPORT_FILE" ]; then
+		jq -s --arg run "$RUN_ID" --arg version "$VERSION" --arg policy "$POLICY" \
+			--arg date "$TODAY" --argjson dry "$DRY_RUN" --argjson days "$RETENTION_DAYS" \
+			--argjson keep "$KEEP_MIN" --argjson summary "$summary" \
+			--arg selector "${SELECTOR_KEY}=${SELECTOR_VALUES}" \
+			'{run_id: $run, version: $version, policy: $policy, backup_date: $date,
+			  dry_run: $dry, selector: $selector, retention_days: $days, keep_min: $keep,
+			  summary: $summary, results: .}' "$RESULTS_FILE" >"$REPORT_FILE"
+		log info "report written" path="$REPORT_FILE"
+	fi
+	log info "run finished" summary="$summary"
+	if [ -f "$WORKDIR/failed" ] ||
+		jq -se 'any(.[]; .status == "failed" or .status == "denied" or .status == "region-error")' \
+			"$RESULTS_FILE" >/dev/null; then
+		return 3
+	fi
+	return 0
+}
+
+main() {
+	local identity rc=0 region
+	parse_args "$@"
+	preflight
+	WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/$PROG.XXXXXX")
+	RESULTS_FILE="$WORKDIR/results.jsonl"
+	: >"$RESULTS_FILE"
+	trap cleanup EXIT
+	trap 'exit 130' INT TERM
+	acquire_lock
+
+	resolve_regions
+	identity=$(aws sts get-caller-identity --query Arn --output text --region "${REGIONS[0]}" \
+		--cli-connect-timeout "$CONNECT_TIMEOUT" --cli-read-timeout "$READ_TIMEOUT" 2>"$WORKDIR/stderr") ||
+		die "no valid AWS credentials: $(tr '\n' ' ' <"$WORKDIR/stderr")"
+	log info "run start" version="$VERSION" identity="$identity" regions="${REGIONS[*]}" \
+		backup_date="$TODAY" dry_run="$DRY_RUN"
+
+	for region in "${REGIONS[@]}"; do
+		process_region "$region"
+	done
+	summarize || rc=$?
+	return "$rc"
+}
+
+# Sourcing the file (tests) defines the functions without running anything.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	main "$@"
+fi

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Fake `aws` for unit tests. Every call is appended to $STUB_LOG (one line).
+#
+# Responses come from files in $STUB_DIR, most specific first:
+#   <op>@<arg>.err | <op>@<arg>.out   when any argument equals <arg>
+#                                     (a volume/snapshot id, a region...)
+#   <op>.err | <op>.out               for every call of <op>
+# A .err file is printed to stderr and the call exits 254 (like the CLI on an
+# API error); a .out file is printed to stdout and the call exits 0.
+# With --dry-run and no dry-run specific file, the call answers DryRunOperation.
+# <op> is the EC2/STS operation name, e.g. describe-instances.
+
+set -o errexit -o nounset -o pipefail
+
+printf '%s\n' "$*" >>"${STUB_LOG:?STUB_LOG not set}"
+
+service=${1:-}
+op=${2:-}
+
+if [ "$service" = "configure" ]; then
+	[ -f "$STUB_DIR/configure-region" ] && cat "$STUB_DIR/configure-region" && exit 0
+	exit 1
+fi
+
+dry=false
+for a in "$@"; do
+	[ "$a" = "--dry-run" ] && dry=true
+done
+
+respond() {
+	local base=$1
+	if [ -f "$base.err" ]; then
+		cat "$base.err" >&2
+		exit 254
+	fi
+	if [ -f "$base.out" ]; then
+		cat "$base.out"
+		exit 0
+	fi
+}
+
+for a in "$@"; do
+	case "$a" in
+	*/* | -* | *' '* | '') continue ;;
+	esac
+	$dry && respond "$STUB_DIR/$op.dryrun@$a"
+	respond "$STUB_DIR/$op@$a"
+done
+$dry && respond "$STUB_DIR/$op.dryrun"
+respond "$STUB_DIR/$op"
+
+if $dry; then
+	echo "An error occurred (DryRunOperation) when calling the operation: Request would have succeeded, but DryRun flag is set." >&2
+	exit 254
+fi
+
+# Defaults when the test did not provide a file.
+case "$service $op" in
+"sts get-caller-identity") echo "arn:aws:iam::111111111111:user/tester" ;;
+"ec2 describe-instances") echo '{"Reservations": []}' ;;
+"ec2 describe-volumes") echo '{"Volumes": []}' ;;
+"ec2 describe-snapshots") echo '{"Snapshots": []}' ;;
+"ec2 describe-regions") echo '{"Regions": [{"RegionName": "us-east-1"}]}' ;;
+"ec2 create-snapshot")
+	vol=""
+	prev=""
+	for a in "$@"; do
+		[ "$prev" = "--volume-id" ] && vol=$a
+		prev=$a
+	done
+	echo "{\"SnapshotId\": \"snap-new-${vol#vol-}\", \"State\": \"pending\"}"
+	;;
+"ec2 delete-snapshot") ;;
+*)
+	echo "stub: no response for: $*" >&2
+	exit 255
+	;;
+esac
