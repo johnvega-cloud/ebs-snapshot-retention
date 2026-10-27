@@ -29,7 +29,8 @@ them with a `CreatedBy` tag, delete the tagged snapshots older than
 `RETENTION_DAYS` (30). The tag is the one safeguard it keeps, so the retention
 step never touches snapshots it did not create. It has no idempotency,
 `keep-min`, dry run, multi-region or error handling beyond `set -e`; the rest
-of this README is about the full tool.
+of this README is about the full tool. Diagram, authoring order and the
+gaps: [build guide, section 3](docs/BUILD_GUIDE.md#3-the-minimal-version-basicebs-snapshot-basicsh).
 
 ## What it does
 
@@ -244,7 +245,7 @@ examples/cron, examples/systemd scheduling
 tests/unit                     bats + fake aws
 tests/integration              bats + AWS CLI + moto
 e2e/aws                        real-account harness (Terraform) + checks
-docs/                          architecture diagram, build guide
+docs/                          architecture diagrams (full + basic), build guide
 ```
 
 ## License

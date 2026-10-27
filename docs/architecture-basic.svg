@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" viewBox="0 0 1300 820" width="1300" height="820" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>ebs-snapshot-basic.sh: the minimal version. Snapshot the EBS volumes of running Backup=true instances, then delete its own tagged snapshots older than 30 days</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#232F3E"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#D13212"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3F8624"/>
+    </marker>
+    <style>
+      .t  { fill: #232F3E; }
+      .mu { fill: #545B64; }
+      .mono { font-family: 'SFMono-Regular', Menlo, Consolas, monospace; font-size: 13px; fill: #232F3E; }
+      .monos { font-family: 'SFMono-Regular', Menlo, Consolas, monospace; font-size: 12px; fill: #545B64; white-space: pre; }
+      .solid { stroke: #232F3E; stroke-width: 2.2; fill: none; }
+      .dash  { stroke: #232F3E; stroke-width: 2; fill: none; stroke-dasharray: 7 5; }
+      .red   { stroke: #D13212; stroke-width: 2.2; fill: none; }
+      .green { stroke: #3F8624; stroke-width: 2.2; fill: none; }
+      .step { fill: #FFFFFF; font-size: 13px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <!-- White canvas so the diagram stays legible on GitHub dark mode -->
+  <rect width="1300" height="820" fill="#FFFFFF"/>
+
+  <text x="30" y="42" class="t" font-size="26" font-weight="700">ebs-snapshot-basic.sh: the minimal version</text>
+  <text x="30" y="68" class="mu" font-size="14">Only what the task asks: snapshot the volumes of running Backup=true instances, delete its own snapshots older than 30 days.</text>
+
+  <!-- ===== Runner ===== -->
+  <rect x="30" y="100" width="300" height="440" rx="8" fill="#F2F3F3" stroke="#545B64" stroke-width="2"/>
+  <text x="50" y="130" class="t" font-size="17" font-weight="700">Runner</text>
+  <text x="50" y="150" class="mu" font-size="13">any host with AWS CLI v2 + credentials</text>
+
+  <rect x="50" y="168" width="260" height="64" rx="6" fill="#FFFFFF" stroke="#E7157B" stroke-width="2"/>
+  <text x="66" y="194" class="t" font-size="15" font-weight="700">cron, once a day</text>
+  <text x="66" y="216" class="mono">0 3 * * *</text>
+  <path class="solid" d="M180,232 L180,250" marker-end="url(#arrow)"/>
+
+  <rect x="50" y="252" width="260" height="190" rx="6" fill="#FFFFFF" stroke="#232F3E" stroke-width="2"/>
+  <text x="66" y="278" class="t" font-size="15" font-weight="700">basic/ebs-snapshot-basic.sh</text>
+  <text x="66" y="302" class="monos">set -euo pipefail</text>
+  <text x="66" y="322" class="monos">AWS_REGION=us-east-1</text>
+  <text x="66" y="342" class="monos">RETENTION_DAYS=30 (default)</text>
+  <text x="66" y="362" class="monos">tag CreatedBy=ebs-snapshot-basic</text>
+  <circle cx="76" cy="396" r="12" fill="#545B64"/><text x="72" y="401" class="step">0</text>
+  <text x="96" y="392" class="t" font-size="13" font-weight="700">cutoff = now - 30 days, UTC</text>
+  <text x="96" y="412" class="monos">taken before step 2: this</text>
+  <text x="96" y="428" class="monos">run never deletes its own</text>
+
+  <rect x="50" y="460" width="260" height="64" rx="6" fill="#FFFFFF" stroke="#545B64" stroke-width="2"/>
+  <text x="66" y="486" class="t" font-size="15" font-weight="700">Output (stdout)</text>
+  <text x="66" y="508" class="monos">created snap-… / deleted snap-…</text>
+
+  <!-- ===== AWS region ===== -->
+  <rect x="370" y="100" width="900" height="560" rx="8" fill="#FFFFFF" stroke="#00A4A6" stroke-width="2" stroke-dasharray="8 5"/>
+  <text x="390" y="130" class="t" font-size="17" font-weight="700">AWS account · one region (AWS_REGION)</text>
+
+  <!-- runner to region -->
+  <path class="solid" d="M310,330 L370,330" marker-end="url(#arrow)"/>
+
+  <!-- step 1: find volumes -->
+  <circle cx="410" cy="182" r="14" fill="#232F3E"/><text x="405" y="187" class="step">1</text>
+  <text x="434" y="178" class="t" font-size="14" font-weight="700">DescribeInstances</text>
+  <text x="434" y="198" class="monos">--filters tag:Backup=true</text>
+  <text x="434" y="216" class="monos">          instance-state-name=running</text>
+  <text x="434" y="234" class="monos">--query ...BlockDeviceMappings[].Ebs.VolumeId</text>
+  <text x="434" y="252" class="monos">-&gt; list of volume ids</text>
+  <path class="dash" d="M820,200 L896,200" marker-end="url(#arrow)"/>
+
+  <!-- EC2 instances -->
+  <rect x="900" y="146" width="350" height="164" rx="6" fill="#FFFFFF" stroke="#ED7100" stroke-width="2"/>
+  <text x="916" y="172" class="t" font-size="15" font-weight="700">EC2 instances</text>
+  <rect x="916" y="184" width="318" height="34" rx="4" fill="#FFFFFF" stroke="#3F8624" stroke-width="2"/>
+  <text x="928" y="206" class="monos">running · Backup=true   -&gt; its volumes</text>
+  <rect x="916" y="226" width="318" height="34" rx="4" fill="#F2F3F3" stroke="#879196" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="928" y="248" class="monos">stopped · Backup=true   -&gt; ignored</text>
+  <rect x="916" y="266" width="318" height="34" rx="4" fill="#F2F3F3" stroke="#879196" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="928" y="288" class="monos">running · no Backup=true -&gt; ignored</text>
+
+  <!-- step 2: snapshot -->
+  <circle cx="410" cy="312" r="14" fill="#3F8624"/><text x="405" y="317" class="step">2</text>
+  <text x="434" y="308" class="t" font-size="14" font-weight="700">CreateSnapshot, one per volume</text>
+  <text x="434" y="328" class="monos">--tag-specifications</text>
+  <text x="434" y="346" class="monos">  ResourceType=snapshot,CreatedBy=ebs-snapshot-basic</text>
+  <text x="434" y="364" class="monos">tag set in the same call: never left untagged</text>
+  <path class="green" d="M820,384 L896,384" marker-end="url(#arrowGreen)"/>
+
+  <!-- step 3: list own snapshots -->
+  <circle cx="410" cy="442" r="14" fill="#232F3E"/><text x="405" y="447" class="step">3</text>
+  <text x="434" y="438" class="t" font-size="14" font-weight="700">DescribeSnapshots</text>
+  <text x="434" y="458" class="monos">--owner-ids self</text>
+  <text x="434" y="476" class="monos">--filters tag:CreatedBy=ebs-snapshot-basic</text>
+  <text x="434" y="494" class="monos">--query Snapshots[].[SnapshotId,StartTime]</text>
+  <path class="dash" d="M896,470 L820,470" marker-end="url(#arrow)"/>
+
+  <!-- step 4: delete old -->
+  <circle cx="410" cy="562" r="14" fill="#D13212"/><text x="405" y="567" class="step">4</text>
+  <text x="434" y="558" class="t" font-size="14" font-weight="700">DeleteSnapshot if StartTime &lt; cutoff</text>
+  <text x="434" y="578" class="monos">ISO-8601 sorts as text: a string compare,</text>
+  <text x="434" y="596" class="monos">no epoch math</text>
+  <path class="red" d="M820,568 L896,568" marker-end="url(#arrowRed)"/>
+
+  <!-- EBS snapshots -->
+  <rect x="900" y="340" width="350" height="300" rx="6" fill="#FFFFFF" stroke="#3F8624" stroke-width="2"/>
+  <text x="916" y="366" class="t" font-size="15" font-weight="700">EBS snapshots</text>
+  <rect x="916" y="378" width="318" height="140" rx="4" fill="#FFFFFF" stroke="#232F3E" stroke-width="1.6"/>
+  <text x="928" y="400" class="t" font-size="13" font-weight="700">CreatedBy=ebs-snapshot-basic</text>
+  <text x="928" y="424" class="monos">taken by this run        keep</text>
+  <text x="928" y="446" class="monos">newer than cutoff        keep</text>
+  <text x="928" y="468" class="monos">older than cutoff</text>
+  <text x="1121" y="468" font-family="'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#D13212">delete</text>
+  <text x="928" y="500" class="monos">pending snapshots finish on their own</text>
+  <rect x="916" y="532" width="318" height="92" rx="4" fill="#F2F3F3" stroke="#879196" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="928" y="556" class="t" font-size="13" font-weight="700">No CreatedBy tag: never listed</text>
+  <text x="928" y="578" class="monos">manual snapshots · AMI snapshots</text>
+  <text x="928" y="596" class="monos">AWS Backup / DLM · other accounts</text>
+  <text x="928" y="614" class="monos">-&gt; never deleted</text>
+
+  <!-- ===== Left out ===== -->
+  <rect x="30" y="690" width="1240" height="104" rx="8" fill="#F2F3F3" stroke="#879196" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="50" y="718" class="t" font-size="15" font-weight="700">Left out on purpose (the full tool, bin/ebs-snapshot-backup, has each one)</text>
+  <text x="50" y="744" class="monos">second run the same day -&gt; second snapshot   ·   terminated instance -&gt; its last copy expires after 30 days (no keep-min)</text>
+  <text x="50" y="764" class="monos">one region only   ·   no dry run   ·   set -e stops at the first failed call (e.g. a snapshot used by an AMI)</text>
+  <text x="50" y="784" class="monos">no lock, no report, no DoNotDelete tag, no --max-deletes brake</text>
+</svg>

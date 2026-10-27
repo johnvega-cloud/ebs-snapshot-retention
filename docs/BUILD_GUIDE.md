@@ -6,6 +6,11 @@ This guide covers the project in two orders:
    Each step only depends on what the previous steps already defined.
 2. **Execution order**: what happens, call by call, on every run.
 
+Section 3 does the same for the **minimal version**
+([`basic/ebs-snapshot-basic.sh`](../basic/ebs-snapshot-basic.sh)), which does
+only what the task asks. Start there if you want the idea before the safety
+features.
+
 ![Architecture](architecture-ebs-snapshots.svg)
 
 ---
@@ -102,3 +107,53 @@ flowchart TD
 6. `run-e2e.sh` waits for the role to be assumable (IAM is eventually
    consistent), then runs the checks; the script's own prune deletes every
    snapshot it made before `terraform destroy`.
+
+---
+
+## 3. The minimal version (`basic/ebs-snapshot-basic.sh`)
+
+![Minimal version](architecture-basic.svg)
+
+Under 50 lines, AWS CLI only (no `jq`). It keeps one safeguard from the full
+tool, the ownership tag, because without it step 3 would delete **any** old
+snapshot in the account: AMI snapshots, someone's manual copy, AWS Backup
+recovery points.
+
+### Authoring order
+
+| Step | What | Why it comes here |
+|---|---|---|
+| 1 | `set -euo pipefail`, `RETENTION_DAYS` (default 30), the tag `CreatedBy=ebs-snapshot-basic` | Every later step uses them. The tag is decided first because creation and deletion must agree on it. |
+| 2 | The cutoff, `now - RETENTION_DAYS` in UTC, computed **before** any snapshot is created | If it were computed after the snapshots are created, one taken a second earlier could fall before it and be deleted by the same run (seen in moto with `RETENTION_DAYS=0`). `date -d` is GNU (Linux), `date -v` is BSD (macOS): try one, fall back to the other. |
+| 3 | `describe-instances` with `tag:Backup=true` and `instance-state-name=running`, `--query` down to `Ebs.VolumeId`, `--output text` | Read-only and safe to run first. Two filters are an AND, applied by AWS. |
+| 4 | `create-snapshot` per volume with `--tag-specifications` | Tags set in the creating call: if a separate `create-tags` failed, the snapshot would stay untagged and retention would never see it. |
+| 5 | `describe-snapshots --owner-ids self` filtered by the tag, `--query [SnapshotId,StartTime]`, then `delete-snapshot` when `StartTime < cutoff` | Last, so a run that dies halfway leaves more copies, never fewer. ISO-8601 timestamps sort as text, so a string comparison replaces date arithmetic. |
+| 6 | `tests/integration/basic.bats` | Real AWS CLI against moto: the right volumes are picked, young snapshots stay, old own snapshots go, this run's and untagged ones stay. CI runs it on Linux, so the `date -d` branch is covered too. |
+
+### Execution order
+
+```mermaid
+flowchart TD
+  A[cutoff = now - RETENTION_DAYS, UTC] --> B[DescribeInstances: Backup=true AND running]
+  B --> C{volume ids?}
+  C -- none --> E
+  C -- each --> D[CreateSnapshot, tag CreatedBy=ebs-snapshot-basic]
+  D --> E[DescribeSnapshots: owner self AND tag CreatedBy]
+  E --> F{StartTime < cutoff?}
+  F -- yes --> G[DeleteSnapshot]
+  F -- no --> H[keep]
+  B -- error --> X[set -e: exit non-zero]
+  D -- error --> X
+  G -- error --> X
+```
+
+### What the full tool adds, and why
+
+| Gap in the minimal version | What happens | Full tool |
+|---|---|---|
+| No idempotency | Two runs on the same day take two snapshots per volume | One snapshot per volume, policy and UTC day (`ebs-backup:backup-date` tag) |
+| No `keep-min` | When an instance is terminated or untagged, its last copy expires after 30 days | The newest **completed** snapshot of each volume is always kept |
+| Any error stops the run | A snapshot used by an AMI (`InvalidSnapshot.InUse`) aborts the rest of the deletes | Per-snapshot results (`skipped-in-use`, `denied`...), keeps going, exit `3` |
+| One region | Only `AWS_REGION` | `--region` (repeatable) or `--all-regions` |
+| No dry run, lock, report, `DoNotDelete` or `--max-deletes` | Nothing to preview, nothing stops two runs at once or a mass delete | All of them, plus an IAM policy that enforces the tag rules |
+
