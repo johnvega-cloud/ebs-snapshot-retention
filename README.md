@@ -23,6 +23,14 @@ that deletes "snapshots older than 30 days" can delete AMI snapshots, manual
 copies, AWS Backup recovery points or the only copy of a volume that stopped
 being backed up. This one is built so that it cannot.
 
+**Minimal version.** [`basic/ebs-snapshot-basic.sh`](basic/ebs-snapshot-basic.sh)
+does only what the task asks, in under 50 lines: find the volumes, snapshot
+them with a `CreatedBy` tag, delete the tagged snapshots older than
+`RETENTION_DAYS` (30). The tag is the one safeguard it keeps, so the retention
+step never touches snapshots it did not create. It has no idempotency,
+`keep-min`, dry run, multi-region or error handling beyond `set -e`; the rest
+of this README is about the full tool.
+
 ## What it does
 
 For each selected region:
@@ -168,7 +176,7 @@ bin/ebs-snapshot-backup --tag Backup=true,True,yes
 ```bash
 bats tests/unit                 # 69 tests, fake `aws` on PATH, no network
 pip install 'moto[server]'
-bats tests/integration          # 11 tests, real AWS CLI against moto's EC2
+bats tests/integration          # 14 tests (11 full tool + 3 basic), real AWS CLI against moto's EC2
 shellcheck -x bin/ebs-snapshot-backup && shfmt -d bin tests
 ```
 
@@ -230,6 +238,7 @@ rule bypassed. Everything was destroyed afterwards. Full table:
 
 ```text
 bin/ebs-snapshot-backup        the script (single file)
+basic/ebs-snapshot-basic.sh    minimal version: only what the task asks
 iam/                           least-privilege IAM policy
 examples/cron, examples/systemd scheduling
 tests/unit                     bats + fake aws

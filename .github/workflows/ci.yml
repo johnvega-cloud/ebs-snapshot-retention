@@ -32,10 +32,10 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck -x bin/ebs-snapshot-backup tests/helpers/bin/aws tests/helpers/common.bash
+          shellcheck -x bin/ebs-snapshot-backup basic/ebs-snapshot-basic.sh tests/helpers/bin/aws tests/helpers/common.bash
           shellcheck -s bash tests/unit/*.bats tests/integration/*.bats
       - name: shfmt
-        run: shfmt -d bin tests
+        run: shfmt -d bin basic tests
       - name: IAM policy is valid JSON
         run: jq -e '.Version == "2012-10-17"' iam/ebs-snapshot-backup-policy.json
       - uses: hashicorp/setup-terraform@v3
